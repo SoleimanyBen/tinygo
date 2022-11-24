@@ -6,6 +6,7 @@ package machine
 import (
 	"device/esp"
 	"errors"
+	"machine"
 	"runtime/volatile"
 	"unsafe"
 )
@@ -25,10 +26,33 @@ var (
 )
 
 const (
-	PinOutput PinMode = iota
-	PinInput
-	PinInputPullup
-	PinInputPulldown
+	PinInput     PinMode = 0
+	PinOutput            = (1 << 1)
+	PinFunction          = (1 << 2)
+	PinPullup            = (1 << 3)
+	PinPulldown          = (1 << 4)
+	PinOpenDrain         = (1 << 5)
+	PinFunction0         = 0
+	PinFunction1         = (1 << 6)
+	PinFunction2         = (1 << 7)
+	// PinFunction3         = (1 << 8)
+	// PinFunction4         = (1 << 9)
+	// PinSpecial = (1 << 13)
+	PinInputPullup     = PinInput | PinPullup
+	PinInputPulldown   = PinInput | PinPulldown
+	PinOutputOpenDrain = PinOutput | PinOpenDrain
+	PinInputFunction   = PinInput | PinFunction
+	PinInputFunction0  = PinInput | PinFunction0
+	PinInputFunction1  = PinInput | PinFunction1
+	PinInputFunction2  = PinInput | PinFunction2
+	// PinInputFunction3  = PinInput | PinFunction3
+	// PinInputFunction4  = PinInput | PinFunction4
+	PinOutputFunction  = PinOutput | PinFunction
+	PinOutputFunction0 = PinOutput | PinFunction0
+	PinOutputFunction1 = PinOutput | PinFunction1
+	PinOutputFunction2 = PinOutput | PinFunction2
+	// PinOutputFunction3 = PinOutput | PinFunction3
+	// PinOutputFunction4 = PinOutput | PinFunction4
 )
 
 // Hardware pin numbers
@@ -151,6 +175,72 @@ func (p Pin) outFunc() *volatile.Register32 {
 // function selection.
 func inFunc(signal uint32) *volatile.Register32 {
 	return (*volatile.Register32)(unsafe.Pointer((uintptr(unsafe.Pointer(&esp.GPIO.FUNC0_IN_SEL_CFG)) + uintptr(signal)*4)))
+}
+
+// matrixOut provides a way to configure a peripheral signal to be rotued through the GPIO matrix and back to a pad.
+// The signal output is routed through the GPIO matrix -> IO MUX -> I/O Pad.
+// This procedure was created by following the steps in the ESP32 TMR: Section 4.3.2: https://www.espressif.com/sites/default/files/documentation/esp32_technical_reference_manual_en.pdf#subsubsection.4.3.2
+func (p Pin) matrixOut(signal uint32, inverted, enable bool) {
+	// Only the 28 GPIOs can be used as outputs
+	if p > 39 {
+		return
+	}
+
+	invertedNum := uint32(0)
+	enableNum := uint32(0)
+	if inverted {
+		invertedNum = 1
+	}
+	if enable {
+		enableNum = 1
+	}
+
+	// Get FUNC_OUT_SEL_CFG register
+	outFuncCfg := p.outFunc()
+
+	// GPIO.func_out_sel_cfg[gpio].func_sel = signal_idx;
+	// Set the OUT_SEL field to the index of the desired peripheral output signal
+	// This appears to already be set during the pin configuration
+
+	// The following calls are used to configure the FUNC_OUT_SEL of the selected pin
+
+	// GPIO.func_out_sel_cfg[gpio].inv_sel = out_inv;
+	// Set OUT_INV_SEL which inverst the output signal (what does this do?)
+	outFuncCfg.SetBits(invertedNum << esp.GPIO_FUNC_OUT_SEL_CFG_OUT_INV_SEL_Pos)
+
+	// GPIO.func_out_sel_cfg[gpio].oen_sel = 0;
+	// Set OEN_SEL which would signify if this signal should always be enabled as an output.
+	outFuncCfg.SetBits(enableNum << esp.GPIO_FUNC_OUT_SEL_CFG_OEN_SEL_Pos)
+
+	// GPIO.func_out_sel_cfg[gpio].oen_inv_sel = oen_inv;
+	outFuncCfg.SetBits(enableNum << esp.GPIO_FUNC_OUT_SEL_CFG_OEN_INV_SEL_Pos)
+}
+
+// matrixIn provides a way to configure how a peripheral signal is routed through the GPIO matrix and IO mux.
+// This procedure was created by following the steps in the ESP32 TMR: Section 4.2.2: https://www.espressif.com/sites/default/files/documentation/esp32_technical_reference_manual_en.pdf#subsubsection.4.2.2
+func (p Pin) matrixIn(signal uint32, inverted bool) {
+	if p > 28 {
+		return
+	}
+
+	invertedNum := uint32(0)
+	if inverted {
+		invertedNum = 1
+	}
+
+	inFuncCfg := inFunc(signal)
+
+	// The following calls are used to configure the FUNC_IN_SEL of the selected pin.
+
+	// Set whether or not the signal should be inverted.
+	inFuncCfg.SetBits(invertedNum << esp.GPIO_FUNC_IN_SEL_CFG_IN_INV_SEL_Pos)
+
+	// Enable and route the signal through the GPIO matrix.
+	inFuncCfg.SetBits(1 << esp.GPIO_FUNC_IN_SEL_CFG_IN_SEL_Pos)
+
+	// Selects the control for the peripheral input. We set the GPIO pad number to read the data from.
+	inFuncCfg.SetBits(uint32(p) << esp.GPIO_FUNC_IN_SEL_CFG_SEL_Pos)
+
 }
 
 // Set the pin to high or low.
@@ -540,4 +630,128 @@ func (spi SPI) Tx(w, r []byte) error {
 	}
 
 	return nil
+}
+
+// opcodes used to determine waht kind of command the current message is
+const (
+	i2cCmdRestart = iota
+	i2cCmdWrite
+	i2cCmdRead
+	i2cCmdStop
+	i2cCmdEnd
+)
+
+const (
+	i2cSignalSCL = 29
+	i2cSignalSDA = 30
+)
+
+var (
+	I2C0 = I2C{
+		Bus:    esp.I2C0,
+		clkBit: 7,
+	}
+	I2C1 = I2C{
+		Bus:    esp.I2C1,
+		clkBit: 18,
+	}
+)
+
+type I2C struct {
+	Bus *esp.I2C_Type
+
+	clkBit uint32
+	rstBit uint32
+}
+
+type I2CConfig struct {
+	Frequency   uint32
+	SCL         Pin
+	SDA         Pin
+	Enable10Bit bool
+	SlaveAddr   uint32
+}
+
+const i2cFilterCycNum = 7
+
+// Configure sets up the I2C for us on the specified SCL and SDA pins.
+// This function is based on this i2c implementation: https://github.com/PX4/NuttX/blob/6ae751cd56f27a51ae91af8f5c5ce00c04b874cb/arch/xtensa/src/esp32/esp32_i2c.c#L641
+func (i2c *I2C) Configure(config I2CConfig) error {
+	if config.Frequency == 0 {
+		config.Frequency = 100 * machine.MHz
+	}
+
+	if config.SDA == 0 && config.SCL == 0 {
+		config.SDA = SDA_PIN
+		config.SCL = SCL_PIN
+	}
+
+	// esp32_gpiowrite(config->scl_pin, 1);
+	config.SCL.High()
+
+	// esp32_gpiowrite(config->sda_pin, 1);
+	config.SDA.High()
+
+	//  esp32_configgpio(config->scl_pin, INPUT | OUTPUT | OPEN_DRAIN | FUNCTION_3);
+	config.SCL.Configure(PinConfig{Mode: PinOutputOpenDrain | PinFunction2})
+
+	// esp32_gpio_matrix_out(config->scl_pin, config->scl_outsig, 0, 0);
+	config.SCL.matrixOut(i2cSignalSCL, false, false)
+	// esp32_gpio_matrix_in(config->scl_pin, config->scl_insig, 0);
+	config.SCL.matrixIn(i2cSignalSCL, false)
+
+	// esp32_configgpio(config->sda_pin, INPUT | OUTPUT | OPEN_DRAIN | FUNCTION_3);
+	config.SDA.Configure(PinConfig{Mode: PinInput | PinOutputOpenDrain | PinFunction2})
+
+	//  esp32_gpio_matrix_out(config->sda_pin, config->sda_outsig, 0, 0);
+	config.SDA.matrixOut(i2cSignalSDA, false, false)
+	//  esp32_gpio_matrix_in(config->sda_pin, config->sda_insig, 0);
+	config.SDA.matrixIn(i2cSignalSDA, false)
+
+	//  modifyreg32(DPORT_PERIP_CLK_EN_REG, 0, config->clk_bit);
+	esp.DPORT.SetPERIP_CLK_EN(1 << i2c.clkBit)
+	// modifyreg32(DPORT_PERIP_RST_EN_REG, config->rst_bit, 0);
+	esp.DPORT.SetPERIP_RST_EN(0 << i2c.clkBit)
+
+	i2c.Bus.INT_ENA.Set(0)
+	i2c.Bus.INT_CLR.Set(^uint32(0)) // places max UINT32 value into INT_CLR reg
+	i2c.Bus.CTR.Set(esp.I2C_CTR_MS_MODE | esp.I2C_CTR_SCL_FORCE_OUT | esp.I2C_CTR_SDA_FORCE_OUT)
+
+	i2c.Bus.FIFO_CONF.ClearBits(esp.I2C_FIFO_CONF_NONFIFO_EN)
+
+	i2c.resetFIFO()
+
+	i2c.Bus.SCL_FILTER_CFG.Set(esp.I2C_SCL_FILTER_CFG_SCL_FILTER_EN | i2cFilterCycNum)
+	i2c.Bus.SDA_FILTER_CFG.Set(esp.I2C_SDA_FILTER_CFG_SDA_FILTER_EN | i2cFilterCycNum)
+
+	initI2CClock(i2c.Bus, config.Frequency)
+
+	return nil
+}
+
+func (i2c *I2C) resetFIFO() {
+	i2c.Bus.SetFIFO_CONF_TX_FIFO_RST(1)
+	i2c.Bus.SetFIFO_CONF_TX_FIFO_RST(0)
+
+	i2c.Bus.SetFIFO_CONF_RX_FIFO_RST(1)
+	i2c.Bus.SetFIFO_CONF_RX_FIFO_RST(0)
+}
+
+func initI2CClock(bus *esp.I2C_Type, frequency uint32) {
+	halfCycles := 80 * machine.MHz / frequency / 2
+	timeoutCycles := halfCycles * 20
+
+	if frequency == timeoutCycles {
+		return
+	}
+
+	bus.SetSCL_LOW_PERIOD_PERIOD(halfCycles)
+	bus.SetSCL_HIGH_PERIOD_PERIOD(halfCycles)
+	bus.SetSDA_HOLD_TIME(halfCycles / 2)
+	bus.SetSDA_SAMPLE_TIME(halfCycles / 2)
+	bus.SetSCL_RSTART_SETUP_TIME(halfCycles)
+	bus.SetSCL_STOP_SETUP_TIME(halfCycles)
+	bus.SetSCL_START_HOLD_TIME(halfCycles)
+	bus.SetSCL_STOP_HOLD_TIME(halfCycles)
+	bus.SetTO_TIME_OUT_REG(timeoutCycles)
 }
