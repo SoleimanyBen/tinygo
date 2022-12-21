@@ -28,6 +28,7 @@ const (
 	PinInput
 	PinInputPullup
 	PinInputPulldown
+	PinAnalog
 )
 
 const (
@@ -90,11 +91,18 @@ func (p Pin) Configure(config PinConfig) {
 		muxConfig |= esp.IO_MUX_GPIO_FUN_WPD
 	}
 
+	// Setup analog function of the GPIO
+	if config.Mode == PinAnalog {
+		muxConfig &^= esp.IO_MUX_GPIO_FUN_IE
+		muxConfig &^= esp.IO_MUX_GPIO_FUN_WPU
+		muxConfig &^= esp.IO_MUX_GPIO_FUN_WPD
+	} else {
+		// Set the output signal to the simple GPIO output.
+		p.outFunc().Set(0x80)
+	}
+
 	// Configure the pad with the given IO mux configuration.
 	p.mux().Set(muxConfig)
-
-	// Set the output signal to the simple GPIO output.
-	p.outFunc().Set(0x80)
 
 	switch config.Mode {
 	case PinOutput:
@@ -236,6 +244,93 @@ func setupPinInterrupt() error {
 		// clear interrupt bit
 		esp.GPIO.STATUS_W1TC.SetBits(status)
 	}).Enable()
+}
+
+func InitADC() {
+	esp.SYSTEM.PERIP_CLK_EN0.SetBits(esp.SYSTEM_PERIP_CLK_EN0_APB_SARADC_CLK_EN)
+	esp.SYSTEM.PERIP_RST_EN0.SetBits(esp.SYSTEM_PERIP_RST_EN0_APB_SARADC_RST)
+	esp.SYSTEM.PERIP_CLK_EN0.SetBits(esp.SYSTEM_PERIP_CLK_EN0_ADC2_ARB_CLK_EN)
+	esp.SYSTEM.PERIP_RST_EN0.SetBits(esp.SYSTEM_PERIP_RST_EN0_ADC2_ARB_RST)
+
+	// esp.SYSTEM.SetPERIP_CLK_EN0_APB_SARADC_CLK_EN(1)
+	// esp.APB_SARADC.SetCTRL2_SARADC_TIMER_EN(1)
+
+	// esp.APB_SARADC.CLKM_CONF.SetBits(esp.APB_SARADC_CLKM_CONF_CLK_EN)
+	// esp.APB_SARADC.CLKM_CONF.SetBits(0 << esp.APB_SARADC_CLKM_CONF_CLK_SEL_Pos)
+}
+
+// adc returns the ADC that belongs to the provided pin. If the pin does not belong to an ADC, 0 is returned.
+func (a ADC) adc() uint8 {
+	switch a.Pin {
+	case GPIO0, GPIO1, GPIO2, GPIO3, GPIO4: // ADC1
+		return 1
+	case GPIO5: // ADC2
+		return 2
+	default:
+		return 0
+	}
+}
+
+const handlerID = 5
+
+func (a ADC) Configure(cfg ADCConfig) {
+	cfg.Resolution = 3
+
+	esp.APB_SARADC.INT_ENA.SetBits(esp.APB_SARADC_INT_ENA_APB_SARADC1_DONE_INT_ENA)
+	esp.APB_SARADC.INT_ENA.SetBits(esp.APB_SARADC_INT_ENA_APB_SARADC2_DONE_INT_ENA)
+	esp.APB_SARADC.INT_ENA.SetBits(esp.APB_SARADC_INT_ENA_APB_SARADC_THRES0_HIGH_INT_ENA)
+	esp.APB_SARADC.INT_ENA.SetBits(esp.APB_SARADC_INT_ENA_APB_SARADC_THRES0_LOW_INT_ENA)
+
+	// Find out whether supplied Pin is part of ADC1 or ADC2
+	switch a.adc() {
+	case 1: // ADC1
+		println("using ADC1 for sampling on pin ", a.Pin)
+		// Select ADC1 as the ADC for one time sampling
+		esp.APB_SARADC.SetONETIME_SAMPLE_SARADC1_ONETIME_SAMPLE(1)
+
+		// Set the GPIO channel
+		esp.APB_SARADC.SetONETIME_SAMPLE_SARADC_ONETIME_CHANNEL(4)
+		// esp.APB_SARADC.SetINT_ENA_APB_SARADC1_DONE_INT_ENA(1)
+	case 2: // ADC2
+		esp.APB_SARADC.SetONETIME_SAMPLE_SARADC2_ONETIME_SAMPLE(1)
+
+		// We only have one channel to chose from, which is 0.
+		esp.APB_SARADC.SetONETIME_SAMPLE_SARADC_ONETIME_CHANNEL(0)
+		esp.APB_SARADC.SetINT_ENA_APB_SARADC2_DONE_INT_ENA(1)
+	}
+
+	esp.APB_SARADC.ONETIME_SAMPLE.SetBits(3 << esp.APB_SARADC_ONETIME_SAMPLE_SARADC_ONETIME_ATTEN_Pos)
+
+	println(esp.APB_SARADC.ONETIME_SAMPLE.Get())
+
+	// a.Pin.Configure(PinConfig{Mode: PinAnalog})
+
+	// inFunc(45).Set(esp.GPIO_FUNC_IN_SEL_CFG_SIG_IN_SEL | 4)
+}
+
+func (a ADC) Get() uint16 {
+	esp.APB_SARADC.SetONETIME_SAMPLE_SARADC_ONETIME_START(0)
+	esp.APB_SARADC.SetONETIME_SAMPLE_SARADC_ONETIME_START(1)
+
+	var res uint16
+	switch a.adc() {
+	case 1:
+		for esp.APB_SARADC.INT_ST.Get() != 0 {
+		}
+
+		raw := esp.APB_SARADC.SAR1DATA_STATUS.Get()
+		println("raw: ", raw)
+		res = uint16(raw)
+	case 2:
+		for esp.APB_SARADC.GetINT_ST_APB_SARADC2_DONE_INT_ST() != 0 {
+		}
+		raw := esp.APB_SARADC.GetSAR2DATA_STATUS_APB_SARADC2_DATA()
+		res = uint16(raw)
+	}
+
+	esp.APB_SARADC.SetONETIME_SAMPLE_SARADC_ONETIME_START(0)
+
+	return res
 }
 
 var (
@@ -502,4 +597,15 @@ func (uart *UART) WriteByte(b byte) error {
 	}
 	uart.Bus.FIFO.Set(uint32(b))
 	return nil
+}
+
+func ReadTemperature() uint32 {
+	esp.APB_SARADC.APB_TSENS_CTRL.SetBits(esp.APB_SARADC_APB_TSENS_CTRL_TSENS_PU)
+	esp.SYSTEM.SetPERIP_CLK_EN1_TSENS_CLK_EN(1)
+
+	for esp.APB_SARADC.GetAPB_TSENS_CTRL_TSENS_OUT() == 0 {
+		println(esp.APB_SARADC.GetTSENS_CTRL2_TSENS_XPD_WAIT())
+	}
+
+	return esp.APB_SARADC.GetAPB_TSENS_CTRL_TSENS_OUT()
 }

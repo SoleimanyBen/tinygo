@@ -1,0 +1,6 @@
+{
+    "go.toolsEnvVars": {
+        "GOROOT": "/home/ben/.cache/tinygo/goroot-a649d0f778f347dfa6d7d0808a563efb3a18dcfbe6e9c3bccb78bb526aa536b9",
+        "GOFLAGS": "-tags=tinygo.riscv,baremetal,linux,arm,tinygo.riscv32,esp32c3,esp,esp32c312f,tinygo,math_big_pure_go,gc.conservative,scheduler.tasks,serial.uart"
+    }
+}
